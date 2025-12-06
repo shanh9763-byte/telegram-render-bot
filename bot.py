@@ -1,386 +1,242 @@
 import os
-import sqlite3
 import csv
-import io
-from datetime import datetime, date
+import asyncio
+from datetime import datetime
 
-import httpx
-from telegram import Update, Chat
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
 )
 
-# Lấy token từ biến môi trường trên Render
+import dns.resolver
+
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong Environment Variables")
 
-DB_PATH = "expenses.db"
+# ----------------------------------------
+# STATES FOR INLINE MENU (PRIVATE CHAT)
+# ----------------------------------------
+ASK_DOMAIN_CNAME, ASK_DOMAIN_DNS = range(2)
 
 
-# ==========================
-#   PHẦN DB CHI TIÊU
-# ==========================
+# =========================
+# GROUP FUNCTIONS (EXPENSE)
+# =========================
+expenses = {}  # { chat_id : [ {amount, desc, timestamp}, ... ] }
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            amount INTEGER NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL
-        )
-        """
+
+def add_expense(chat_id, amount, desc):
+    if chat_id not in expenses:
+        expenses[chat_id] = []
+    expenses[chat_id].append({
+        "amount": amount,
+        "desc": desc,
+        "time": datetime.now()
+    })
+
+
+def get_today_total(chat_id):
+    if chat_id not in expenses:
+        return 0
+
+    today = datetime.now().date()
+    return sum(e["amount"] for e in expenses[chat_id] if e["time"].date() == today)
+
+
+def get_month_total(chat_id):
+    if chat_id not in expenses:
+        return 0
+
+    now = datetime.now()
+    return sum(
+        e["amount"] for e in expenses[chat_id]
+        if e["time"].year == now.year and e["time"].month == now.month
     )
-    conn.commit()
-    conn.close()
 
 
-def add_expense_db(chat_id: int, user_id: int, username: str, amount: int, note: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO expenses (chat_id, user_id, username, amount, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            chat_id,
-            user_id,
-            username,
-            amount,
-            note,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+def export_csv(chat_id):
+    filename = f"expenses_{chat_id}.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Amount", "Description", "Time"])
+        for e in expenses.get(chat_id, []):
+            writer.writerow([e["amount"], e["desc"], e["time"]])
+    return filename
 
 
-def sum_expenses_db(chat_id: int, mode: str = "today") -> int:
-    """
-    mode = today | month | all
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    if mode == "today":
-        start = date.today().isoformat()
-        end = start + "T23:59:59"
-        c.execute(
-            """
-            SELECT SUM(amount) FROM expenses
-            WHERE chat_id = ? AND created_at BETWEEN ? AND ?
-            """,
-            (chat_id, start, end),
-        )
-    elif mode == "month":
-        today = date.today()
-        start = today.replace(day=1).isoformat()
-        # không cần end chính xác, chỉ cần lớn hơn mọi ngày trong tháng
-        end = f"{today.year}-{today.month:02d}-31T23:59:59"
-        c.execute(
-            """
-            SELECT SUM(amount) FROM expenses
-            WHERE chat_id = ? AND created_at BETWEEN ? AND ?
-            """,
-            (chat_id, start, end),
-        )
-    else:  # all
-        c.execute(
-            """
-            SELECT SUM(amount) FROM expenses
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        )
-
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row and row[0] is not None else 0
-
-
-def export_expenses_db(chat_id: int) -> io.BytesIO:
-    """
-    Export về CSV (Excel mở được bình thường)
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT created_at, username, amount, note
-        FROM expenses
-        WHERE chat_id = ?
-        ORDER BY created_at ASC
-        """,
-        (chat_id,),
-    )
-    rows = c.fetchall()
-    conn.close()
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Thời gian (UTC)", "Người nhập", "Số tiền", "Ghi chú"])
-    for created_at, username, amount, note in rows:
-        writer.writerow([created_at, username or "", amount, note or ""])
-
-    data = io.BytesIO(output.getvalue().encode("utf-8"))
-    data.name = "chi_tieu.csv"
-    return data
-
-
-# ==========================
-#   HELPER PARSE SỐ TIỀN
-# ==========================
-
-def parse_amount(text: str) -> int | None:
-    """
-    Hỗ trợ các kiểu:
-    - 200000
-    - 200k / 200K  -> 200 * 1000
-    - 200.000      -> 200000
-    """
-    text = text.replace(".", "").replace(",", "").strip().lower()
-    if not text:
-        return None
-
-    if text.endswith("k"):
-        try:
-            base = int(text[:-1])
-            return base * 1000
-        except ValueError:
-            return None
-
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
-# ==========================
-#   HANDLER CHUNG
-# ==========================
+# =========================
+# PRIVATE MENU / START
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat: Chat = update.effective_chat
-    if chat.type in ("group", "supergroup"):
-        msg = (
-            "👋 Xin chào mọi người!\n\n"
-            "Tao là bot **chi tiêu + DNS**.\n\n"
-            "💸 *Trong nhóm* tao làm chi tiêu:\n"
-            "  • /add 200k ăn sáng\n"
-            "  • /total – tổng hôm nay\n"
-            "  • /total month – tổng tháng này\n"
-            "  • /total all – tổng mọi thời gian\n"
-            "  • /export – xuất file CSV mở bằng Excel\n\n"
-            "💬 Nhắn riêng tao để dùng chức năng DNS:\n"
-            "  • /dns example.com\n"
-            "  • /cname example.com\n"
-        )
-    else:
-        msg = (
-            "👋 Xin chào!\n\n"
-            "💸 Vào *nhóm gia đình* để dùng chức năng chi tiêu.\n"
-            "💻 Ở đây (chat riêng) tao hỗ trợ kiểm tra DNS:\n"
-            "  • /dns example.com – xem bản ghi A\n"
-            "  • /cname example.com – xem bản ghi CNAME\n"
-        )
-    await update.message.reply_markdown(msg)
-
-
-# ==========================
-#   CHI TIÊU (GROUP)
-# ==========================
-
-async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Lệnh chi tiêu chỉ dùng trong nhóm nha.")
+
+    # -------- GROUP START --------
+    if chat.type in ("group", "supergroup"):
+        txt = (
+            "👋 *Xin chào mọi người!*\n\n"
+            "💸 *Hệ thống quản lý chi tiêu nhóm*\n"
+            "• /add 200k ăn sáng\n"
+            "• /total – Tổng hôm nay\n"
+            "• /total month – Tổng tháng\n"
+            "• /export – Xuất file CSV\n\n"
+            "💬 Dùng chức năng DNS trong chat riêng."
+        )
+        await update.message.reply_markdown(txt)
         return
 
-    if not context.args:
-        await update.message.reply_text("Dùng: /add [số tiền] [ghi chú]\nVí dụ: /add 200k ăn sáng")
-        return
-
-    amount_str = context.args[0]
-    note = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-
-    amount = parse_amount(amount_str)
-    if amount is None or amount <= 0:
-        await update.message.reply_text("Số tiền không hợp lệ. Ví dụ: 200000 hoặc 200k")
-        return
-
-    user = update.effective_user
-    add_expense_db(
-        chat_id=chat.id,
-        user_id=user.id,
-        username=user.full_name,
-        amount=amount,
-        note=note,
-    )
-
+    # -------- PRIVATE START --------
+    keyboard = [
+        [
+            InlineKeyboardButton("🔷 Kiểm tra CNAME", callback_data="check_cname"),
+            InlineKeyboardButton("🔷 Kiểm tra DNS (NS)", callback_data="check_dns"),
+        ]
+    ]
     await update.message.reply_text(
-        f"✅ Đã ghi: {amount:,} đ"
-        + (f" – {note}" if note else "")
+        "Chọn loại kiểm tra 👇",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+
+# =========================
+# DNS LOOKUP
+# =========================
+
+async def cname_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    domain = context.args[0]
+    try:
+        answers = dns.resolver.resolve(domain, "CNAME")
+        cname = "\n".join(str(r) for r in answers)
+        await update.message.reply_text(f"🔎 *CNAME Record:*\n{cname}", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi: {e}")
+
+
+async def dns_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    domain = context.args[0]
+    try:
+        answers = dns.resolver.resolve(domain, "NS")
+        ns_list = "\n".join(str(r) for r in answers)
+        await update.message.reply_text(f"🔎 *DNS NS Record:*\n{ns_list}", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi: {e}")
+
+
+# =========================
+# CALLBACK BUTTON → ASK DOMAIN
+# =========================
+
+async def cb_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "check_cname":
+        await query.edit_message_text("Nhập domain để kiểm tra CNAME:")
+        return ASK_DOMAIN_CNAME
+
+    if query.data == "check_dns":
+        await query.edit_message_text("Nhập domain để kiểm tra DNS (NS):")
+        return ASK_DOMAIN_DNS
+
+
+# =========================
+# DOMAIN PROCESS (USER INPUT)
+# =========================
+
+async def process_cname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    domain = update.message.text.strip()
+    context.args = [domain]
+    await cname_lookup(update, context)
+    return ConversationHandler.END
+
+
+async def process_dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    domain = update.message.text.strip()
+    context.args = [domain]
+    await dns_lookup(update, context)
+    return ConversationHandler.END
+
+
+# =========================
+# GROUP COMMANDS
+# =========================
+
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Sai cú pháp. Ví dụ: /add 200k ăn sáng")
+        return
+
+    amount_raw = context.args[0].lower().replace("k", "000")
+    try:
+        amount = int(amount_raw)
+    except:
+        await update.message.reply_text("❌ Số tiền không hợp lệ.")
+        return
+
+    desc = " ".join(context.args[1:])
+    add_expense(chat_id, amount, desc)
+
+    await update.message.reply_text(f"✔ Đã thêm *{amount}đ* – {desc}", parse_mode="Markdown")
 
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Lệnh /total chỉ dùng trong nhóm.")
+    chat_id = update.effective_chat.id
+
+    if context.args and context.args[0] == "month":
+        t = get_month_total(chat_id)
+        await update.message.reply_text(f"📆 Tổng tháng: *{t}đ*", parse_mode="Markdown")
         return
 
-    mode = "today"
-    if context.args:
-        arg = context.args[0].lower()
-        if arg in ["month", "thang", "tháng"]:
-            mode = "month"
-        elif arg in ["all", "tatca", "tấtcả"]:
-            mode = "all"
-
-    total_amount = sum_expenses_db(chat.id, mode=mode)
-    if mode == "today":
-        label = "hôm nay"
-    elif mode == "month":
-        label = "tháng này"
-    else:
-        label = "từ trước tới giờ"
-
-    await update.message.reply_text(
-        f"💰 Tổng chi {label}: {total_amount:,} đ"
-    )
+    t = get_today_total(chat_id)
+    await update.message.reply_text(f"📅 Tổng hôm nay: *{t}đ*", parse_mode="Markdown")
 
 
-async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Lệnh /export chỉ dùng trong nhóm.")
-        return
-
-    file_data = export_expenses_db(chat.id)
-    await update.message.reply_document(
-        document=file_data,
-        filename=file_data.name,
-        caption="📂 File chi tiêu (CSV – mở bằng Excel được).",
-    )
+async def export_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    file = export_csv(chat_id)
+    await update.message.reply_document(open(file, "rb"))
 
 
-# ==========================
-#   DNS / CNAME (PRIVATE)
-# ==========================
+# =========================
+# MAIN APP
+# =========================
 
-async def dns_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("private",):
-        await update.message.reply_text("Lệnh DNS dùng khi nhắn riêng với bot nha.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Dùng: /dns example.com")
-        return
-
-    domain = context.args[0].strip()
-    if not domain:
-        await update.message.reply_text("Domain không hợp lệ.")
-        return
-
-    url = "https://dns.google/resolve"
-    params = {"name": domain, "type": "A"}
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params)
-            data = resp.json()
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi gọi DNS: {e}")
-        return
-
-    answers = data.get("Answer")
-    if not answers:
-        await update.message.reply_text(f"Không tìm thấy bản ghi A cho {domain}")
-        return
-
-    lines = [f"🔎 A record cho *{domain}*:"]
-    for ans in answers:
-        if ans.get("type") == 1:  # A
-            lines.append(f"• {ans.get('data')}")
-
-    await update.message.reply_markdown("\n".join(lines) if len(lines) > 1 else f"Không có A record cho {domain}")
-
-
-async def cname_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("private",):
-        await update.message.reply_text("Lệnh CNAME dùng khi nhắn riêng với bot nha.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Dùng: /cname example.com")
-        return
-
-    domain = context.args[0].strip()
-    if not domain:
-        await update.message.reply_text("Domain không hợp lệ.")
-        return
-
-    url = "https://dns.google/resolve"
-    params = {"name": domain, "type": "CNAME"}
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params)
-            data = resp.json()
-    except Exception as e:
-        await update.message.reply_text(f"Lỗi gọi DNS: {e}")
-        return
-
-    answers = data.get("Answer")
-    if not answers:
-        await update.message.reply_text(f"Không tìm thấy bản ghi CNAME cho {domain}")
-        return
-
-    lines = [f"🔎 CNAME record cho *{domain}*:"]
-    for ans in answers:
-        if ans.get("type") == 5:  # CNAME
-            lines.append(f"• {ans.get('data')}")
-
-    await update.message.reply_markdown("\n".join(lines))
-
-
-# ==========================
-#   MAIN
-# ==========================
-
-def main():
-    # Khởi tạo DB
-    init_db()
-
+async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Lệnh chung
+    # Conversation Handler (Private Menu)
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_select)],
+        states={
+            ASK_DOMAIN_CNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_cname)],
+            ASK_DOMAIN_DNS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_dns)],
+        },
+        fallbacks=[],
+    )
+
+    app.add_handler(conv)
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
-
-    # Chi tiêu (group)
-    app.add_handler(CommandHandler("add", add_expense))
+    app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("total", total))
-    app.add_handler(CommandHandler("export", export_csv))
+    app.add_handler(CommandHandler("export", export_file))
 
-    # DNS (private)
-    app.add_handler(CommandHandler("dns", dns_lookup))
-    app.add_handler(CommandHandler("cname", cname_lookup))
-
-    # Chạy polling – KHÔNG dùng asyncio.run nữa
-    app.run_polling(close_loop=False)
+    print("Bot đang chạy...")
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
