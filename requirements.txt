@@ -1,0 +1,4 @@
+python-telegram-bot==20.7
+dnspython==2.6.1
+requests
+beautifulsoup4
