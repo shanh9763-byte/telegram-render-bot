@@ -4,7 +4,11 @@ import dns.resolver
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -15,17 +19,17 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 conn = sqlite3.connect("expenses.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS expenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user TEXT,
-        amount INTEGER,
-        note TEXT,
-        date TEXT
-    )
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user TEXT,
+    amount INTEGER,
+    note TEXT,
+    date TEXT
+)
 """)
 conn.commit()
 
-def parse_money(text):
+def parse_money(text: str) -> int:
     text = text.lower().replace(" ", "")
     if text.endswith("k"):
         return int(float(text[:-1]) * 1000)
@@ -33,31 +37,39 @@ def parse_money(text):
         return int(float(text[:-1]) * 1_000_000)
     return int(text)
 
+
+# ==========================
+# CHI TIÊU (GROUP)
+# ==========================
 async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         return await update.message.reply_text("Lệnh này chỉ dùng trong nhóm!")
 
+    if len(context.args) < 2:
+        return await update.message.reply_text("Sai cú pháp!\nVD: /add 50k ăn sáng")
+
     try:
         amount = parse_money(context.args[0])
-        note = " ".join(context.args[1:])
-        user = update.effective_user.first_name
-        date = datetime.now().strftime("%Y-%m-%d")
-
-        cursor.execute("INSERT INTO expenses (user, amount, note, date) VALUES (?, ?, ?, ?)",
-                       (user, amount, note, date))
-        conn.commit()
-
-        await update.message.reply_text(f"💰 {user} vừa ghi: {amount:,} vnđ – {note}")
-
     except Exception:
-        await update.message.reply_text("Sai cú pháp!\nVD: /add 50k cafe")
+        return await update.message.reply_text("Không đọc được số tiền (VD: 20k, 1m, 50000)")
+
+    note = " ".join(context.args[1:])
+    user = update.effective_user.first_name
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    cursor.execute("INSERT INTO expenses (user, amount, note, date) VALUES (?, ?, ?, ?)", 
+                   (user, amount, note, date))
+    conn.commit()
+
+    await update.message.reply_text(f"💰 {user} vừa ghi: {amount:,} vnđ — {note}")
+
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
-        return await update.message.reply_text("Lệnh này chỉ dùng trong nhóm!")
+        return
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("SELECT user, amount FROM expenses WHERE date=?", (today,))
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT user, amount FROM expenses WHERE date=?", (today_str,))
     rows = cursor.fetchall()
 
     if not rows:
@@ -73,9 +85,10 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
-        return await update.message.reply_text("Lệnh này chỉ dùng trong nhóm!")
+        return
 
     month_now = datetime.now().strftime("%Y-%m")
     cursor.execute("SELECT user, amount FROM expenses WHERE date LIKE ?", (month_now + "%",))
@@ -96,57 +109,64 @@ async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================
-# DNS CHECKER – PRIVATE CHAT
+# DNS CHECKER (PRIVATE)
 # ==========================
 async def dns_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        return  # Không xử lý trong nhóm
+        return
 
     domains = update.message.text.split()
-    reply_msg = ""
+    if not domains:
+        return
+
+    reply = ""
 
     for domain in domains:
-        reply_msg += f"🔍 *{domain}*\n"
+        reply += f"🔍 *{domain}*\n"
+
+        # A record
         try:
             answers = dns.resolver.resolve(domain, "A")
-            reply_msg += "A Records:\n"
+            reply += "A:\n"
             for r in answers:
-                reply_msg += f"- {r}\n"
+                reply += f"- {r}\n"
         except:
-            reply_msg += "❌ Không tìm thấy A record\n"
+            reply += "❌ Không có A record\n"
 
+        # CNAME
         try:
             answers = dns.resolver.resolve(domain, "CNAME")
-            reply_msg += "CNAME:\n"
+            reply += "CNAME:\n"
             for r in answers:
-                reply_msg += f"- {r}\n"
+                reply += f"- {r}\n"
         except:
-            reply_msg += "❌ Không có CNAME\n"
+            reply += "❌ Không có CNAME\n"
 
-        reply_msg += "\n"
+        reply += "\n"
 
-    await update.message.reply_text(reply_msg, parse_mode="Markdown")
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 # ==========================
-# MAIN APP
+# START
 # ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot hoạt động!\n"
-        "- Nhắn riêng để kiểm tra DNS.\n"
-        "- Vào nhóm để ghi chi tiêu.\n"
+        "- Nhắn **riêng** để kiểm tra DNS.\n"
+        "- Trong **nhóm** dùng: /add /today /month"
     )
+
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # GROUP FEATURES
+    # GROUP commands
     app.add_handler(CommandHandler("add", add_expense))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("month", month))
 
-    # PRIVATE CHAT DNS
+    # PRIVATE DNS
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), dns_check))
 
     # START
